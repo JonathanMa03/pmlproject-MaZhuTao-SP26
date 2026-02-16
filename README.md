@@ -29,15 +29,15 @@ TBD
 ## Structure
 
 ```text
-bayesproject-MaZhuFeng-FA25/
-├── code/                            # Analysis scripts and RMarkdown modules
+pmlproject-MaZhuTao-SP26/
+├── code/                         # Analysis scripts and RMarkdown modules
 ├── data/
 │   └── raw/                      # Immutable input datasets
 │   └── cleaned/                  # Versions of cleaned data
 ├── docs/                         # Documentation and team coordination
 │   ├── CHANGELOG.md              # Project updates and version history
-│   ├── Contributions.md          # Collaboration guidelines and author credits
-│   └── SETUP.md                  # Environment setup and package requirements
+│   ├── ChangeTracking.md          # Collaboration guidelines and author credits
+│   └── InitialSetup.md                  # Environment setup and package requirements
 ├── Reports/                      # Knitted and polished Files
 │   └── Report.pdf                # Final Report
 ├── .gitignore                    # Files and folders excluded from Git tracking
