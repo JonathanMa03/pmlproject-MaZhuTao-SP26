@@ -26,6 +26,10 @@ class StudentTVAR:
 
     eps_t | lambda_t ~ N(0, Sigma / lambda_t)
     lambda_t ~ Gamma(nu/2, nu/2)
+
+    This implementation avoids @ matmul in critical places because some
+    local BLAS/Accelerate setups can emit spurious overflow/divide warnings
+    even when the arrays are finite and well-scaled.
     """
 
     def __init__(
@@ -75,12 +79,14 @@ class StudentTVAR:
         T_eff, d = Y.shape
         k = X.shape[1]
 
-        # OLS initialization
-        beta_t, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-        beta = beta_t.T
+        # OLS initialization using lstsq
+        beta_t, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)   # (k, d)
+        beta = beta_t.T                                       # (d, k)
 
-        residuals = Y - X @ beta_t
-        Sigma = (residuals.T @ residuals) / max(T_eff - k, 1)
+        fitted_values = np.einsum("tk,kd->td", X, beta_t)
+        residuals = Y - fitted_values
+
+        Sigma = np.einsum("ti,tj->ij", residuals, residuals) / max(T_eff - k, 1)
         Sigma = Sigma + self.ridge_sigma * np.eye(d)
 
         lam = np.ones(T_eff, dtype=np.float64)
@@ -94,20 +100,25 @@ class StudentTVAR:
 
         for it in range(n_iter):
             # ---------------------------------------
-            # 1. beta | Sigma, lambda, Y
+            # 1) beta | Sigma, lambda, Y
             # weighted least squares with ridge
             # ---------------------------------------
             W_sqrt = np.sqrt(lam)[:, None]
             Xw = X * W_sqrt
             Yw = Y * W_sqrt
 
-            XtX = Xw.T @ Xw + self.ridge_beta * np.eye(k)
-            XtY = Xw.T @ Yw
+            XtX = np.einsum("ti,tj->ij", Xw, Xw) + self.ridge_beta * np.eye(k)
+            XtY = np.einsum("ti,td->id", Xw, Yw)
+
+            if not np.isfinite(XtX).all():
+                raise RuntimeError(f"XtX became non-finite at iteration {it}.")
+            if not np.isfinite(XtY).all():
+                raise RuntimeError(f"XtY became non-finite at iteration {it}.")
 
             beta_t = np.linalg.solve(XtX, XtY)   # (k, d)
             beta = beta_t.T                      # (d, k)
 
-            fitted_values = X @ beta_t
+            fitted_values = np.einsum("tk,kd->td", X, beta_t)
             residuals = Y - fitted_values
 
             if not np.isfinite(fitted_values).all():
@@ -116,28 +127,26 @@ class StudentTVAR:
                 raise RuntimeError(f"Non-finite residuals at iteration {it}.")
 
             # ---------------------------------------
-            # 2. lambda_t | beta, Sigma, Y
+            # 2) lambda_t | beta, Sigma, Y
             # ---------------------------------------
             Sigma_inv = np.linalg.inv(Sigma)
 
             for t in range(T_eff):
                 e_t = residuals[t]
-                quad = float(e_t.T @ Sigma_inv @ e_t)
+                quad = float(np.einsum("i,ij,j->", e_t, Sigma_inv, e_t))
 
                 shape = 0.5 * (self.nu + d)
                 rate = 0.5 * (self.nu + quad)
 
                 lam[t] = self.rng.gamma(shape=shape, scale=1.0 / rate)
 
-            # stabilize lambda draws
             lam = np.clip(lam, self.lambda_min, self.lambda_max)
 
             # ---------------------------------------
-            # 3. Sigma | beta, lambda, Y
-            # weighted covariance
+            # 3) Sigma | beta, lambda, Y
             # ---------------------------------------
             Ew = residuals * np.sqrt(lam)[:, None]
-            Sigma = (Ew.T @ Ew) / T_eff
+            Sigma = np.einsum("ti,tj->ij", Ew, Ew) / T_eff
             Sigma = Sigma + self.ridge_sigma * np.eye(d)
 
             if not np.isfinite(Sigma).all():
@@ -207,7 +216,7 @@ class StudentTVAR:
             x.extend(last_observations[-lag, :].tolist())
 
         x = np.asarray(x, dtype=np.float64)
-        return beta @ x
+        return np.einsum("dk,k->d", beta, x)
 
     def simulate_one_step(self, last_observations: np.ndarray, n_sim: int = 1000) -> np.ndarray:
         if self.result_ is None:
@@ -224,7 +233,6 @@ class StudentTVAR:
             x.append(1.0)
         for lag in range(1, self.p + 1):
             x.extend(last_observations[-lag, :].tolist())
-
         x = np.asarray(x, dtype=np.float64)
 
         sims = np.zeros((n_sim, d))
@@ -235,7 +243,7 @@ class StudentTVAR:
             beta = self.result_.beta_draws[s]
             Sigma = self.result_.sigma_draws[s]
 
-            mean = beta @ x
+            mean = np.einsum("dk,k->d", beta, x)
             lam_next = self.rng.gamma(shape=self.nu / 2.0, scale=2.0 / self.nu)
             lam_next = np.clip(lam_next, self.lambda_min, self.lambda_max)
 
