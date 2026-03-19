@@ -17,7 +17,7 @@ class GaussianVARResult:
     Attributes
     ----------
     beta : np.ndarray
-        Coefficient matrix of shape (d, k), where each row corresponds to one equation.
+        Coefficient matrix of shape (d, k), where each row is one equation.
     sigma : np.ndarray
         Residual covariance matrix of shape (d, d).
     fitted_values : np.ndarray
@@ -38,57 +38,79 @@ class GaussianVAR:
     """
     Gaussian VAR estimated equation-by-equation by OLS.
 
-    Model:
+    Model
+    -----
         y_t = B x_t + eps_t
         eps_t ~ N(0, Sigma)
 
-    where x_t contains lagged values and possibly an intercept.
+    where x_t contains lagged values and optionally an intercept.
     """
 
     def __init__(self, p: int = 1, intercept: bool = True):
         self.p = p
         self.intercept = intercept
         self.base_var = BaseVAR(p=p, intercept=intercept)
-
         self.result_: Optional[GaussianVARResult] = None
 
     def fit(self, data: pd.DataFrame, date_col: str = "date") -> GaussianVARResult:
         """
-        Fit Gaussian VAR by OLS.
+        Fit Gaussian VAR by ordinary least squares.
 
         Parameters
         ----------
         data : pd.DataFrame
-            DataFrame with date column and numeric series columns.
+            DataFrame with one date column and the remaining columns as numeric series.
         date_col : str
-            Name of date column.
+            Name of the date column.
 
         Returns
         -------
         GaussianVARResult
+            Fitted model result object.
         """
         design = self.base_var.build_design(data, date_col=date_col)
         X, Y = design.X, design.Y
+
         if not np.isfinite(X).all():
-            raise ValueError("X contains non-finite values (NaN or inf). Check preprocessing.")
+            raise ValueError("X contains non-finite values.")
         if not np.isfinite(Y).all():
-            raise ValueError("Y contains non-finite values (NaN or inf). Check preprocessing.")
+            raise ValueError("Y contains non-finite values.")
 
-        # OLS: B' = (X'X)^{-1} X'Y
-        XtX = X.T @ X
-        XtY = X.T @ Y
+        X = np.asarray(X, dtype=np.float64, order="C")
+        Y = np.asarray(Y, dtype=np.float64, order="C")
 
-        beta_t = np.linalg.solve(XtX, XtY)   # shape (k, d)
-        beta = beta_t.T                      # shape (d, k)
+        # OLS using least squares (numerically safer than explicit normal equations)
+        beta_t, residuals_lstsq, rank, s = np.linalg.lstsq(X, Y, rcond=None)
+        beta_t = np.asarray(beta_t, dtype=np.float64, order="C")
 
-        fitted_values = X @ beta_t           # shape (T-p, d)
+        if not np.isfinite(beta_t).all():
+            raise ValueError("Estimated coefficients contain non-finite values.")
+
+        # beta_t has shape (k, d); store beta as (d, k)
+        beta = beta_t.T
+
+        # Use einsum to avoid possible BLAS/matmul warnings on some systems
+        fitted_values = np.einsum("ij,jk->ik", X, beta_t, optimize=True)
         residuals = Y - fitted_values
+
+        if not np.isfinite(fitted_values).all():
+            raise ValueError("Fitted values contain non-finite values.")
+        if not np.isfinite(residuals).all():
+            raise ValueError("Residuals contain non-finite values.")
 
         T_eff, d = residuals.shape
         k = X.shape[1]
 
-        # unbiased residual covariance
+        if T_eff <= k:
+            raise ValueError(
+                f"Not enough effective observations to estimate covariance: "
+                f"T_eff={T_eff}, k={k}."
+            )
+
         sigma = (residuals.T @ residuals) / (T_eff - k)
+
+        if not np.isfinite(sigma).all():
+            raise ValueError("Residual covariance matrix contains non-finite values.")
 
         self.result_ = GaussianVARResult(
             beta=beta,
@@ -106,7 +128,7 @@ class GaussianVAR:
         self._check_is_fitted()
         return self.result_.fitted_values
 
-    def residuals(self) -> np.ndarray:
+    def get_residuals(self) -> np.ndarray:
         """
         Return in-sample residuals.
         """
@@ -115,7 +137,7 @@ class GaussianVAR:
 
     def forecast_one_step(self, last_observations: np.ndarray) -> np.ndarray:
         """
-        One-step-ahead forecast mean.
+        Compute one-step-ahead forecast mean.
 
         Parameters
         ----------
@@ -135,7 +157,6 @@ class GaussianVAR:
         p, d = last_observations.shape
         if p != self.p:
             raise ValueError(f"Expected {self.p} lag rows, got {p}.")
-
         if d != self.result_.design.d:
             raise ValueError(f"Expected d={self.result_.design.d}, got {d}.")
 
@@ -144,13 +165,11 @@ class GaussianVAR:
         if self.intercept:
             x.append(1.0)
 
-        # newest lag first: lag1, lag2, ..., lagp
+        # Build x_t in the same order as BaseVAR: lag1, lag2, ..., lagp
         for lag in range(1, self.p + 1):
             x.extend(last_observations[-lag, :].tolist())
 
-        x = np.asarray(x, dtype=float)
-
-        # beta shape (d, k), so beta @ x -> (d,)
+        x = np.asarray(x, dtype=np.float64)
         return self.result_.beta @ x
 
     def simulate_one_step(self, last_observations: np.ndarray, n_sim: int = 1000) -> np.ndarray:
@@ -177,7 +196,7 @@ class GaussianVAR:
 
     def summary(self) -> dict:
         """
-        Return a minimal summary dictionary.
+        Return a compact summary dictionary.
         """
         self._check_is_fitted()
 
