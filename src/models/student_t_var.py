@@ -11,11 +11,11 @@ from src.models.base_var import BaseVAR, VARDesign
 
 @dataclass
 class StudentTVARResult:
-    beta_draws: list[np.ndarray]       # each draw shape (d, k)
-    sigma_draws: list[np.ndarray]      # each draw shape (d, d)
-    lambda_draws: list[np.ndarray]     # each draw shape (T_eff,)
-    fitted_values_last: np.ndarray     # shape (T_eff, d)
-    residuals_last: np.ndarray         # shape (T_eff, d)
+    beta_draws: list[np.ndarray]
+    sigma_draws: list[np.ndarray]
+    lambda_draws: list[np.ndarray]
+    fitted_values_last: np.ndarray
+    residuals_last: np.ndarray
     design: VARDesign
     nu: float
 
@@ -24,17 +24,8 @@ class StudentTVAR:
     """
     Bayesian VAR with Student-t innovations using scale-mixture augmentation.
 
-    Model
-    -----
-    y_t = B x_t + eps_t
     eps_t | lambda_t ~ N(0, Sigma / lambda_t)
     lambda_t ~ Gamma(nu/2, nu/2)
-
-    Notes
-    -----
-    - Uses Gibbs sampling with latent scales lambda_t.
-    - Uses weighted least squares for beta updates.
-    - Uses a simple inverse-Wishart-style covariance update approximation.
     """
 
     def __init__(
@@ -43,14 +34,24 @@ class StudentTVAR:
         intercept: bool = True,
         nu: float = 8.0,
         seed: int = 123,
+        ridge_beta: float = 1e-6,
+        ridge_sigma: float = 1e-6,
+        lambda_min: float = 1e-4,
+        lambda_max: float = 1e4,
     ):
         if nu <= 2:
-            raise ValueError("nu must be > 2 for finite variance.")
+            raise ValueError("nu must be > 2.")
         self.p = p
         self.intercept = intercept
         self.nu = float(nu)
-        self.base_var = BaseVAR(p=p, intercept=intercept)
         self.rng = np.random.default_rng(seed)
+        self.base_var = BaseVAR(p=p, intercept=intercept)
+
+        self.ridge_beta = ridge_beta
+        self.ridge_sigma = ridge_sigma
+        self.lambda_min = lambda_min
+        self.lambda_max = lambda_max
+
         self.result_: Optional[StudentTVARResult] = None
 
     def fit(
@@ -63,23 +64,25 @@ class StudentTVAR:
         design = self.base_var.build_design(data, date_col=date_col)
         X, Y = design.X, design.Y
 
+        X = np.asarray(X, dtype=np.float64)
+        Y = np.asarray(Y, dtype=np.float64)
+
         if not np.isfinite(X).all():
             raise ValueError("X contains non-finite values.")
         if not np.isfinite(Y).all():
             raise ValueError("Y contains non-finite values.")
 
-        X = np.asarray(X, dtype=np.float64)
-        Y = np.asarray(Y, dtype=np.float64)
-
         T_eff, d = Y.shape
         k = X.shape[1]
 
-        # Initialize
-        beta_t, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)   # (k, d)
-        beta = beta_t.T                                       # (d, k)
+        # OLS initialization
+        beta_t, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
+        beta = beta_t.T
 
         residuals = Y - X @ beta_t
         Sigma = (residuals.T @ residuals) / max(T_eff - k, 1)
+        Sigma = Sigma + self.ridge_sigma * np.eye(d)
+
         lam = np.ones(T_eff, dtype=np.float64)
 
         beta_draws: list[np.ndarray] = []
@@ -90,25 +93,33 @@ class StudentTVAR:
         residuals_last = None
 
         for it in range(n_iter):
-            # -------------------------------------------------
-            # 1) beta | Sigma, lambda, Y
-            #    Weighted least squares with weights lambda_t
-            # -------------------------------------------------
-            W_sqrt = np.sqrt(lam)[:, None]      # (T_eff, 1)
-            Xw = X * W_sqrt                     # (T_eff, k)
-            Yw = Y * W_sqrt                     # (T_eff, d)
+            # ---------------------------------------
+            # 1. beta | Sigma, lambda, Y
+            # weighted least squares with ridge
+            # ---------------------------------------
+            W_sqrt = np.sqrt(lam)[:, None]
+            Xw = X * W_sqrt
+            Yw = Y * W_sqrt
 
-            beta_t, _, _, _ = np.linalg.lstsq(Xw, Yw, rcond=None)  # (k, d)
-            beta = beta_t.T                                        # (d, k)
+            XtX = Xw.T @ Xw + self.ridge_beta * np.eye(k)
+            XtY = Xw.T @ Yw
+
+            beta_t = np.linalg.solve(XtX, XtY)   # (k, d)
+            beta = beta_t.T                      # (d, k)
 
             fitted_values = X @ beta_t
             residuals = Y - fitted_values
 
-            # -------------------------------------------------
-            # 2) lambda_t | beta, Sigma, Y
-            #    Gamma update from Student-t mixture form
-            # -------------------------------------------------
+            if not np.isfinite(fitted_values).all():
+                raise RuntimeError(f"Non-finite fitted values at iteration {it}.")
+            if not np.isfinite(residuals).all():
+                raise RuntimeError(f"Non-finite residuals at iteration {it}.")
+
+            # ---------------------------------------
+            # 2. lambda_t | beta, Sigma, Y
+            # ---------------------------------------
             Sigma_inv = np.linalg.inv(Sigma)
+
             for t in range(T_eff):
                 e_t = residuals[t]
                 quad = float(e_t.T @ Sigma_inv @ e_t)
@@ -116,18 +127,21 @@ class StudentTVAR:
                 shape = 0.5 * (self.nu + d)
                 rate = 0.5 * (self.nu + quad)
 
-                # numpy gamma uses shape and scale = 1/rate
                 lam[t] = self.rng.gamma(shape=shape, scale=1.0 / rate)
 
-            # -------------------------------------------------
-            # 3) Sigma | beta, lambda, Y
-            #    Weighted residual covariance
-            # -------------------------------------------------
+            # stabilize lambda draws
+            lam = np.clip(lam, self.lambda_min, self.lambda_max)
+
+            # ---------------------------------------
+            # 3. Sigma | beta, lambda, Y
+            # weighted covariance
+            # ---------------------------------------
             Ew = residuals * np.sqrt(lam)[:, None]
             Sigma = (Ew.T @ Ew) / T_eff
+            Sigma = Sigma + self.ridge_sigma * np.eye(d)
 
-            # small ridge for stability
-            Sigma = Sigma + 1e-8 * np.eye(d)
+            if not np.isfinite(Sigma).all():
+                raise RuntimeError(f"Non-finite Sigma at iteration {it}.")
 
             fitted_values_last = fitted_values
             residuals_last = residuals
@@ -151,6 +165,7 @@ class StudentTVAR:
     def summary(self) -> dict:
         if self.result_ is None:
             raise RuntimeError("Model is not fitted yet.")
+
         return {
             "p": self.p,
             "intercept": self.intercept,
@@ -174,27 +189,20 @@ class StudentTVAR:
         return np.mean(np.stack(self.result_.sigma_draws, axis=0), axis=0)
 
     def forecast_one_step_mean(self, last_observations: np.ndarray) -> np.ndarray:
-        """
-        Posterior mean one-step-ahead forecast.
-        """
         if self.result_ is None:
             raise RuntimeError("Model is not fitted yet.")
 
         beta = self.posterior_mean_beta()
 
-        if last_observations.ndim != 2:
-            raise ValueError("last_observations must have shape (p, d).")
-
         p, d = last_observations.shape
         if p != self.p:
-            raise ValueError(f"Expected {self.p} lag rows, got {p}.")
+            raise ValueError(f"Expected {self.p} lags, got {p}.")
         if d != self.result_.design.d:
-            raise ValueError(f"Expected d={self.result_.design.d}, got {d}.")
+            raise ValueError(f"Expected {self.result_.design.d} series, got {d}.")
 
         x = []
         if self.intercept:
             x.append(1.0)
-
         for lag in range(1, self.p + 1):
             x.extend(last_observations[-lag, :].tolist())
 
@@ -202,30 +210,25 @@ class StudentTVAR:
         return beta @ x
 
     def simulate_one_step(self, last_observations: np.ndarray, n_sim: int = 1000) -> np.ndarray:
-        """
-        Simulate one-step-ahead draws from the posterior predictive distribution.
-        """
         if self.result_ is None:
             raise RuntimeError("Model is not fitted yet.")
 
-        if last_observations.ndim != 2:
-            raise ValueError("last_observations must have shape (p, d).")
-
         p, d = last_observations.shape
         if p != self.p:
-            raise ValueError(f"Expected {self.p} lag rows, got {p}.")
+            raise ValueError(f"Expected {self.p} lags, got {p}.")
         if d != self.result_.design.d:
-            raise ValueError(f"Expected d={self.result_.design.d}, got {d}.")
+            raise ValueError(f"Expected {self.result_.design.d} series, got {d}.")
 
         x = []
         if self.intercept:
             x.append(1.0)
         for lag in range(1, self.p + 1):
             x.extend(last_observations[-lag, :].tolist())
+
         x = np.asarray(x, dtype=np.float64)
 
+        sims = np.zeros((n_sim, d))
         n_draws = len(self.result_.beta_draws)
-        sims = np.zeros((n_sim, d), dtype=np.float64)
 
         for i in range(n_sim):
             s = self.rng.integers(0, n_draws)
@@ -234,6 +237,8 @@ class StudentTVAR:
 
             mean = beta @ x
             lam_next = self.rng.gamma(shape=self.nu / 2.0, scale=2.0 / self.nu)
-            sims[i] = self.rng.multivariate_normal(mean=mean, cov=Sigma / lam_next)
+            lam_next = np.clip(lam_next, self.lambda_min, self.lambda_max)
+
+            sims[i] = self.rng.multivariate_normal(mean, Sigma / lam_next)
 
         return sims
