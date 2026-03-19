@@ -34,7 +34,6 @@ def preprocess_daily_prices(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> pd.DataFrame:
-
     out = df.rename(columns=rename_map).copy()
 
     missing = set(REQUIRED_COLUMNS) - set(out.columns)
@@ -57,15 +56,17 @@ def preprocess_daily_prices(
     if end_date is not None:
         out = out[out["date"] <= pd.to_datetime(end_date)]
 
-    # --- compute returns ---
+    # Critical: log requires strictly positive close
+    out = out[out["close"] > 0].copy()
+
     out["log_return"] = 100.0 * np.log(out["close"]).diff()
 
-    # --- drop first NaN ---
+    # Remove NaN/inf created by diff or bad source rows
+    out = out.replace([np.inf, -np.inf], np.nan)
     out = out.dropna(subset=["log_return"])
 
-    # --- 🔥 FIX: remove extreme data errors ---
+    # Filter obvious data errors / split artifacts
     out = out[(out["log_return"] > -50) & (out["log_return"] < 50)]
 
     out = out.reset_index(drop=True)
-
     return out
