@@ -18,6 +18,7 @@ class SVVARResult:
     design: VARDesign
     phi: float
     sigma_h: float
+    acceptance_rate: float
 
 
 class SVVAR:
@@ -34,10 +35,9 @@ class SVVAR:
 
     Notes
     -----
-    - This is a practical diagonal-SV implementation.
-    - beta updated by weighted least squares.
-    - latent log-volatilities h updated by random-walk Metropolis steps.
-    - good as a project model before attempting a full multivariate SV sampler.
+    - Diagonal stochastic volatility only
+    - beta updated by weighted least squares
+    - h updated by random-walk Metropolis
     """
 
     def __init__(
@@ -64,8 +64,8 @@ class SVVAR:
         self.rng = np.random.default_rng(seed)
         self.base_var = BaseVAR(p=p, intercept=intercept)
 
-        self.ridge_beta = ridge_beta
-        self.proposal_sd = proposal_sd
+        self.ridge_beta = float(ridge_beta)
+        self.proposal_sd = float(proposal_sd)
 
         self.result_: Optional[SVVARResult] = None
 
@@ -91,13 +91,13 @@ class SVVAR:
         k_features = X.shape[1]
 
         # OLS initialization
-        beta_t, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-        beta = beta_t.T
+        beta_t, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)  # (k_features, d)
+        beta = beta_t.T                                      # (d, k_features)
 
         fitted_values = np.einsum("tk,kd->td", X, beta_t)
         residuals = Y - fitted_values
 
-        # initialize log volatilities from residual variance
+        # initialize h from residual variances
         init_var = np.var(residuals, axis=0, ddof=1)
         init_var = np.where(init_var <= 1e-8, 1e-8, init_var)
         h = np.log(init_var)[None, :] * np.ones((T_eff, d), dtype=np.float64)
@@ -108,11 +108,13 @@ class SVVAR:
         fitted_values_last = None
         residuals_last = None
 
+        n_accept = 0
+        n_total = 0
+
         for it in range(n_iter):
-            # ---------------------------------------
+            # -------------------------------------------------
             # 1) beta | h, Y
-            # weighted least squares equation by equation
-            # ---------------------------------------
+            # -------------------------------------------------
             beta_new = np.zeros((d, k_features), dtype=np.float64)
 
             for j in range(d):
@@ -137,10 +139,9 @@ class SVVAR:
             if not np.isfinite(residuals).all():
                 raise RuntimeError(f"Non-finite residuals at iteration {it}.")
 
-            # ---------------------------------------
-            # 2) h | beta, Y
-            # random-walk Metropolis update for each h_{t,j}
-            # ---------------------------------------
+            # -------------------------------------------------
+            # 2) h | beta, Y via RW-MH
+            # -------------------------------------------------
             for j in range(d):
                 for t in range(T_eff):
                     current = h[t, j]
@@ -152,7 +153,6 @@ class SVVAR:
                         h_prev=h[t - 1, j] if t > 0 else None,
                         h_next=h[t + 1, j] if t < T_eff - 1 else None,
                     )
-
                     logpost_proposal = self._log_h_conditional(
                         h_value=proposal,
                         residual=residuals[t, j],
@@ -161,9 +161,11 @@ class SVVAR:
                     )
 
                     log_accept = logpost_proposal - logpost_current
+                    n_total += 1
 
                     if np.log(self.rng.uniform()) < log_accept:
                         h[t, j] = proposal
+                        n_accept += 1
 
             fitted_values_last = fitted_values
             residuals_last = residuals
@@ -171,6 +173,8 @@ class SVVAR:
             if it >= burn:
                 beta_draws.append(beta.copy())
                 h_draws.append(h.copy())
+
+        acceptance_rate = n_accept / max(n_total, 1)
 
         self.result_ = SVVARResult(
             beta_draws=beta_draws,
@@ -180,6 +184,7 @@ class SVVAR:
             design=design,
             phi=self.phi,
             sigma_h=self.sigma_h,
+            acceptance_rate=acceptance_rate,
         )
         return self.result_
 
@@ -193,26 +198,32 @@ class SVVAR:
         """
         Log conditional density contribution for one latent log-volatility state.
         """
-        # Observation likelihood:
+        # observation contribution:
         # e_t | h_t ~ N(0, exp(h_t))
         obs = -0.5 * (np.log(2.0 * np.pi) + h_value + (residual**2) / np.exp(h_value))
 
         prior = 0.0
 
-        # prior from previous transition
+        # stationary prior for h_1:
+        # h_1 ~ N(0, sigma_h^2 / (1 - phi^2))
         if h_prev is None:
-            # stationary-ish initialization around 0
-            prior += -0.5 * (h_value / 1.0) ** 2
+            sd0 = self.sigma_h / np.sqrt(1.0 - self.phi**2)
+            prior += -0.5 * (np.log(2.0 * np.pi * sd0**2) + (h_value**2) / (sd0**2))
         else:
             mean_prev = self.phi * h_prev
-            prior += -0.5 * ((h_value - mean_prev) / self.sigma_h) ** 2
+            prior += -0.5 * (
+                np.log(2.0 * np.pi * self.sigma_h**2)
+                + ((h_value - mean_prev) ** 2) / (self.sigma_h**2)
+            )
 
-        # prior from next transition
         if h_next is not None:
             mean_next = self.phi * h_value
-            prior += -0.5 * ((h_next - mean_next) / self.sigma_h) ** 2
+            prior += -0.5 * (
+                np.log(2.0 * np.pi * self.sigma_h**2)
+                + ((h_next - mean_next) ** 2) / (self.sigma_h**2)
+            )
 
-        return obs + prior
+        return float(obs + prior)
 
     def summary(self) -> dict:
         if self.result_ is None:
@@ -222,6 +233,7 @@ class SVVAR:
             "intercept": self.intercept,
             "phi": self.phi,
             "sigma_h": self.sigma_h,
+            "acceptance_rate": self.result_.acceptance_rate,
             "n_saved_draws": len(self.result_.beta_draws),
             "n_obs_effective": self.result_.design.Y.shape[0],
             "n_series": self.result_.design.d,
@@ -240,11 +252,9 @@ class SVVAR:
             raise RuntimeError("Model is not fitted yet.")
         return np.mean(np.stack(self.result_.h_draws, axis=0), axis=0)
 
-    def forecast_one_step_mean(self, last_observations: np.ndarray) -> np.ndarray:
+    def _build_x_vector(self, last_observations: np.ndarray) -> np.ndarray:
         if self.result_ is None:
             raise RuntimeError("Model is not fitted yet.")
-
-        beta = self.posterior_mean_beta()
 
         p, d = last_observations.shape
         if p != self.p:
@@ -257,41 +267,43 @@ class SVVAR:
             x.append(1.0)
         for lag in range(1, self.p + 1):
             x.extend(last_observations[-lag, :].tolist())
-        x = np.asarray(x, dtype=np.float64)
+        return np.asarray(x, dtype=np.float64)
 
+    def forecast_one_step_mean(self, last_observations: np.ndarray) -> np.ndarray:
+        if self.result_ is None:
+            raise RuntimeError("Model is not fitted yet.")
+
+        beta = self.posterior_mean_beta()
+        x = self._build_x_vector(last_observations)
         return np.einsum("dk,k->d", beta, x)
 
     def simulate_one_step(self, last_observations: np.ndarray, n_sim: int = 1000) -> np.ndarray:
         if self.result_ is None:
             raise RuntimeError("Model is not fitted yet.")
 
-        p, d = last_observations.shape
-        if p != self.p:
-            raise ValueError(f"Expected {self.p} lags, got {p}.")
-        if d != self.result_.design.d:
-            raise ValueError(f"Expected {self.result_.design.d} series, got {d}.")
+        x = self._build_x_vector(last_observations)
 
-        x = []
-        if self.intercept:
-            x.append(1.0)
-        for lag in range(1, self.p + 1):
-            x.extend(last_observations[-lag, :].tolist())
-        x = np.asarray(x, dtype=np.float64)
-
-        sims = np.zeros((n_sim, d))
+        sims = np.zeros((n_sim, self.result_.design.d), dtype=np.float64)
         n_draws = len(self.result_.beta_draws)
 
         for i in range(n_sim):
             s = self.rng.integers(0, n_draws)
+
             beta = self.result_.beta_draws[s]
-            h_last = self.result_.h_draws[s][-1]   # last latent vol state
+            h_last = self.result_.h_draws[s][-1]  # last latent vol state for draw s
 
             mean = np.einsum("dk,k->d", beta, x)
 
-            # propagate log-vol one step ahead
-            h_next = self.phi * h_last + self.rng.normal(scale=self.sigma_h, size=d)
-            Sigma_next = np.diag(np.exp(h_next))
+            # propagate one-step-ahead latent log-volatility
+            h_next = self.phi * h_last + self.rng.normal(
+                loc=0.0,
+                scale=self.sigma_h,
+                size=self.result_.design.d,
+            )
 
-            sims[i] = self.rng.multivariate_normal(mean, Sigma_next)
+            std_next = np.exp(h_next / 2.0)
+            eps = self.rng.normal(loc=0.0, scale=std_next, size=self.result_.design.d)
+
+            sims[i] = mean + eps
 
         return sims

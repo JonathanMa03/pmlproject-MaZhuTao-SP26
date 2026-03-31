@@ -1,5 +1,5 @@
 model,parameter,ESS
-student_t,beta_SPY_eq_SPY_lag1,229.62415081714823
-student_t,sigma_SPY_SPY,138.4023632358292
-mixture,beta_SPY_eq_SPY_lag1,393.3679006140764
-mixture,sigma0_SPY_SPY,64.15850226189133
+student_t,beta_SPY_eq_SPY_lag1,1183.4142975703533
+student_t,sigma_SPY_SPY,770.6953471374991
+mixture,beta_SPY_eq_SPY_lag1,1437.8251778220438
+mixture,sigma0_SPY_SPY,246.987824325426
