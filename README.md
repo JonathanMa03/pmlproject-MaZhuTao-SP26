@@ -177,7 +177,7 @@ pmlproject-MaZhuTao-SP26/
 ├── outputs/                      # Outputs from code, indexed by date
 ├── reports/                      # Final report
 │   └── Report.pdf
-├── src/                          # scripts
+├── src/                          # scripts and source
 ├── config.py                     # Directory control
 ├── models_notebook.ipynb         # Analysis notebook
 ├── .gitignore
