@@ -2,7 +2,7 @@
 
 This repository hosts the final project for **EN.553.724 Probabilistic Machine Learning (Spring 2026)** at Johns Hopkins University.
 
-**Authors:** Jonathan Ma, Sijia Zhu, Sibo Tao  
+**Authors:** [Jonathan Ma](https://jonathanma03.github.io/), [Sijia Zhu], [Sibo Tao]  
 **Instructor:** Dr. Holden Lee
 
 ---
